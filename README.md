@@ -220,6 +220,58 @@ table = to_arrow(quotes, recursive=False)    # requires pyarrow
 
 For column output, uninitialized slotted fields are represented as `None` so every column remains the same length. Single-record `to_dict()` still skips uninitialized slots.
 
+## ML and Data Science Workflows
+
+ML and data science code often starts with ordinary Python objects and eventually needs records, columns, or DataFrames for evaluation, monitoring, plotting, or export.
+
+```python
+from unpackable import compile_projector, to_pandas, unpackable
+
+
+@unpackable(recursive=False)
+class Prediction:
+    __slots__ = ("user_id", "model_version", "score", "label", "latency_ms")
+
+    def __init__(self, user_id, model_version, score, label, latency_ms):
+        self.user_id = user_id
+        self.model_version = model_version
+        self.score = score
+        self.label = label
+        self.latency_ms = latency_ms
+
+
+predictions = [
+    Prediction("u1", "fraud-v4", 0.91, 1, 12.4),
+    Prediction("u2", "fraud-v4", 0.08, 0, 9.7),
+    Prediction("u3", "fraud-v4", 0.63, 1, 14.1),
+]
+
+projector = compile_projector(Prediction)
+
+columns = projector.columns(predictions)
+records = projector.records(predictions)
+```
+
+`columns` is immediately useful for metrics, drift checks, plotting, or DataFrame construction:
+
+```python
+{
+    "user_id": ["u1", "u2", "u3"],
+    "model_version": ["fraud-v4", "fraud-v4", "fraud-v4"],
+    "score": [0.91, 0.08, 0.63],
+    "label": [1, 0, 1],
+    "latency_ms": [12.4, 9.7, 14.1],
+}
+```
+
+If pandas is installed, you can go straight to a DataFrame:
+
+```python
+df = to_pandas(predictions, recursive=False)
+```
+
+This is useful when you want readable domain objects inside your inference, simulation, or evaluation code, but tabular output at the analysis boundary.
+
 ## Field Order
 
 Field order is stable and intentional:
