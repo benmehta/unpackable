@@ -1,19 +1,33 @@
 from .core import (
+    Projector,
     SupportsUnpackable,
     asdict,
     astuple,
+    compile_projector,
     fields,
     is_unpackable,
+    to_arrow,
+    to_columns,
     to_jsonable,
+    to_pandas,
+    to_records,
+    to_tuples,
     unpackable,
 )
 
 __all__ = [
+    "Projector",
     "SupportsUnpackable",
     "asdict",
     "astuple",
+    "compile_projector",
     "fields",
     "is_unpackable",
+    "to_arrow",
+    "to_columns",
     "to_jsonable",
+    "to_pandas",
+    "to_records",
+    "to_tuples",
     "unpackable",
 ]

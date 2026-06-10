@@ -10,7 +10,7 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")),
 )
 
-from unpackable import asdict, astuple, unpackable
+from unpackable import asdict, astuple, compile_projector, to_columns, to_records, unpackable
 
 
 @unpackable
@@ -141,9 +141,15 @@ def _optional_cases() -> Dict[str, Tuple[Any, List[Tuple[str, str]]]]:
 
         cases["msgspec"] = (
             MsgspecTick("AAPL", 192.4, 100),
-            [("msgspec.to_builtins(obj)", "msgspec.to_builtins(obj)")],
+            [
+                ("msgspec.to_builtins(obj)", "msgspec.to_builtins(obj)"),
+                ("msgspec.to_builtins(100)", "msgspec.to_builtins(msgspec_batch)"),
+            ],
         )
         globals()["msgspec"] = msgspec
+        globals()["msgspec_batch"] = [
+            MsgspecTick("AAPL", 192.4, 100) for _ in range(100)
+        ]
     except ImportError:
         pass
 
@@ -175,13 +181,15 @@ if __name__ == "__main__":
     setup = (
         "from __main__ import "
         "SlottedTick, FlatSlottedTick, DynamicTick, ManualSlottedTick, ManualDynamicTick, DataclassTick, "
-        "DATACLASS_LABEL, asdict, astuple, dataclasses; "
+        "DATACLASS_LABEL, asdict, astuple, compile_projector, to_columns, to_records, dataclasses; "
         "s = SlottedTick('AAPL', 192.4, 100); "
         "f = FlatSlottedTick('AAPL', 192.4, 100); "
         "d = DynamicTick('AAPL', 192.4, 100); "
         "m = ManualSlottedTick('AAPL', 192.4, 100); "
         "md = ManualDynamicTick('AAPL', 192.4, 100); "
-        "dc = DataclassTick('AAPL', 192.4, 100)"
+        "dc = DataclassTick('AAPL', 192.4, 100); "
+        "p = compile_projector(FlatSlottedTick); "
+        "batch = [FlatSlottedTick('AAPL', 192.4, 100) for _ in range(100)]"
     )
 
     print(f"Iterations: {number:,}")
@@ -191,6 +199,7 @@ if __name__ == "__main__":
     run_case("unpackable runtime flat to_dict()", "s.to_dict(recursive=False)", setup, number)
     run_case("unpackable flat to_dict()", "f.to_dict()", setup, number)
     run_case("unpackable flat to_tuple()", "f.to_tuple()", setup, number)
+    run_case("projector flat to_dict()", "p.to_dict(f)", setup, number)
     run_case("helper asdict(slotted)", "asdict(s)", setup, number)
     run_case("helper astuple(slotted)", "astuple(s)", setup, number)
     run_case("manual slotted tuple(obj)", "tuple(m)", setup, number)
@@ -201,6 +210,10 @@ if __name__ == "__main__":
     run_case("unpackable dynamic to_dict()", "d.to_dict()", setup, number)
     run_case("dynamic __dict__.copy()", "d.__dict__.copy()", setup, number)
     run_case("manual dynamic to_dict()", "md.to_dict()", setup, number)
+    run_case("projector records(100)", "p.records(batch)", setup, number // 100)
+    run_case("projector columns(100)", "p.columns(batch)", setup, number // 100)
+    run_case("helper to_records(100)", "to_records(batch, recursive=False)", setup, number // 100)
+    run_case("helper to_columns(100)", "to_columns(batch, recursive=False)", setup, number // 100)
 
     optional = _optional_cases()
     for package_name, (obj, package_cases) in optional.items():

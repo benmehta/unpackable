@@ -4,7 +4,18 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from unpackable import asdict, astuple, fields, is_unpackable, to_jsonable, unpackable
+from unpackable import (
+    asdict,
+    astuple,
+    compile_projector,
+    fields,
+    is_unpackable,
+    to_columns,
+    to_jsonable,
+    to_records,
+    to_tuples,
+    unpackable,
+)
 
 
 class UnpackableTests(unittest.TestCase):
@@ -285,6 +296,122 @@ class UnpackableTests(unittest.TestCase):
         self.assertEqual(
             asdict(Shape()),
             {"points": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]},
+        )
+
+    def test_compiled_projector_projects_records_tuples_and_columns(self):
+        @unpackable(recursive=False)
+        class Tick:
+            __slots__ = ("symbol", "price", "size")
+
+            def __init__(self, symbol, price, size):
+                self.symbol = symbol
+                self.price = price
+                self.size = size
+
+        ticks = [Tick("AAPL", 192.4, 100), Tick("MSFT", 410.2, 50)]
+        projector = compile_projector(Tick)
+
+        self.assertEqual(projector.fields, ("symbol", "price", "size"))
+        self.assertEqual(
+            projector.records(ticks),
+            [
+                {"symbol": "AAPL", "price": 192.4, "size": 100},
+                {"symbol": "MSFT", "price": 410.2, "size": 50},
+            ],
+        )
+        self.assertEqual(
+            projector.tuples(ticks),
+            [("AAPL", 192.4, 100), ("MSFT", 410.2, 50)],
+        )
+        self.assertEqual(
+            projector.columns(ticks),
+            {
+                "symbol": ["AAPL", "MSFT"],
+                "price": [192.4, 410.2],
+                "size": [100, 50],
+            },
+        )
+
+    def test_top_level_batch_projection_helpers(self):
+        class Tick:
+            __slots__ = ("symbol", "price", "size")
+
+            def __init__(self, symbol, price, size):
+                self.symbol = symbol
+                self.price = price
+                self.size = size
+
+        ticks = [Tick("AAPL", 192.4, 100), Tick("MSFT", 410.2, 50)]
+
+        self.assertEqual(
+            to_records(ticks, aliases={"symbol": "s"}, recursive=False),
+            [
+                {"s": "AAPL", "price": 192.4, "size": 100},
+                {"s": "MSFT", "price": 410.2, "size": 50},
+            ],
+        )
+        self.assertEqual(
+            to_tuples(ticks, fields=("price", "symbol"), recursive=False),
+            [(192.4, "AAPL"), (410.2, "MSFT")],
+        )
+        self.assertEqual(
+            to_columns(ticks, fields=("symbol", "size"), recursive=False),
+            {"symbol": ["AAPL", "MSFT"], "size": [100, 50]},
+        )
+
+    def test_projector_columns_use_none_for_missing_slots(self):
+        class Partial:
+            __slots__ = ("ready", "missing")
+
+            def __init__(self, ready, set_missing=False):
+                self.ready = ready
+                if set_missing:
+                    self.missing = "set"
+
+        rows = [Partial(True), Partial(False, set_missing=True)]
+        projector = compile_projector(Partial, recursive=False)
+
+        self.assertEqual(
+            projector.columns(rows),
+            {"ready": [True, False], "missing": [None, "set"]},
+        )
+        self.assertEqual(projector.records(rows), [{"ready": True}, {"ready": False, "missing": "set"}])
+
+    def test_dynamic_projector_columns_pad_varying_fields(self):
+        class Row:
+            def __init__(self, **values):
+                vars(self).update(values)
+
+        rows = [Row(a=1), Row(a=2, b=3), Row(b=4)]
+
+        self.assertEqual(
+            to_columns(rows, recursive=False),
+            {"a": [1, 2, None], "b": [None, 3, 4]},
+        )
+
+    def test_projector_recursive_mode(self):
+        @unpackable
+        class Point:
+            __slots__ = ("x", "y")
+
+            def __init__(self):
+                self.x = 1
+                self.y = 2
+
+        @unpackable(recursive=False)
+        class Box:
+            __slots__ = ("point",)
+
+            def __init__(self):
+                self.point = Point()
+
+        box = Box()
+        projector = compile_projector(Box)
+
+        self.assertIs(projector.to_dict(box)["point"], box.point)
+        self.assertEqual(
+            compile_projector(Box, recursive=True).to_dict(box),
+            {"point": {"x": 1, "y": 2}},
         )
 
 

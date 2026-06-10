@@ -2,14 +2,14 @@
 
 Zero-dependency unpacking and projection for ordinary Python objects.
 
-This is not a validator, a schema system, or a model framework. It is a tiny decorator and helper API that makes normal Python classes easier to unpack, expand, and project.
+This is not a validator, a schema system, or a model framework. It is a tiny decorator and projection engine that makes normal Python classes easier to unpack, expand, batch, and project.
 
 The core promise:
 
-> Not a validator. Not a model framework. Just fast, zero-dependency unpacking for real Python objects.
+> Not a validator. Not a model framework. Fast projection for real Python objects.
 
 ```python
-from unpackable import unpackable
+from unpackable import compile_projector, unpackable
 
 
 @unpackable
@@ -28,6 +28,10 @@ symbol, price, size = tick
 payload = {**tick}
 row = tick.to_tuple()
 doc = tick.to_dict()
+
+projector = compile_projector(Tick, recursive=False)
+records = projector.records([tick])
+columns = projector.columns([tick])
 ```
 
 ## Why
@@ -41,6 +45,7 @@ Many Python libraries focus on validation, parsing, coercion, and schema managem
 - Tuple-style sequence unpacking.
 - Dictionary-style `**object` unpacking.
 - Recursive conversion for nested objects, lists, tuples, and dictionaries.
+- Batch projection into records, tuples, or columns.
 - No runtime validation layer and no third-party dependencies.
 
 Use Pydantic, attrs, dataclasses, or msgspec when you want their modeling, validation, or serialization ecosystems. Use this when you want to keep plain classes and add unpacking/projection behavior with one decorator.
@@ -160,6 +165,61 @@ assert astuple(point) == (1, 2)
 
 The decorator is the fastest and most ergonomic path when you control the class. The helpers are useful for one-off projection, migration, debugging, and codebases where method injection is not desired.
 
+## Projection Engine
+
+For repeated workloads, compile a projector once and reuse it:
+
+```python
+from unpackable import compile_projector
+
+
+projector = compile_projector(Quote, recursive=False)
+
+records = projector.records(quotes)
+tuples = projector.tuples(quotes)
+columns = projector.columns(quotes)
+```
+
+Records are list-of-dict output:
+
+```python
+[
+    {"symbol": "AAPL", "bid": 192.31, "ask": 192.34},
+    {"symbol": "MSFT", "bid": 410.10, "ask": 410.14},
+]
+```
+
+Columns are dict-of-list output:
+
+```python
+{
+    "symbol": ["AAPL", "MSFT"],
+    "bid": [192.31, 410.10],
+    "ask": [192.34, 410.14],
+}
+```
+
+Top-level helpers are available when you do not want to hold onto a projector:
+
+```python
+from unpackable import to_columns, to_records, to_tuples
+
+records = to_records(quotes, recursive=False)
+columns = to_columns(quotes, recursive=False)
+tuples = to_tuples(quotes, recursive=False)
+```
+
+Optional bridges are dependency-free until called:
+
+```python
+from unpackable import to_arrow, to_pandas
+
+df = to_pandas(quotes, recursive=False)      # requires pandas
+table = to_arrow(quotes, recursive=False)    # requires pyarrow
+```
+
+For column output, uninitialized slotted fields are represented as `None` so every column remains the same length. Single-record `to_dict()` still skips uninitialized slots.
+
 ## Field Order
 
 Field order is stable and intentional:
@@ -199,22 +259,25 @@ The benchmark always compares decorated objects, manual methods, and `dataclasse
 Example run on Python 3.12.13:
 
 ```text
-unpackable slotted tuple(obj)          532.8 ns/call
-unpackable slotted {**obj}             951.9 ns/call
-unpackable recursive to_dict()         510.3 ns/call
-unpackable runtime flat to_dict()      207.9 ns/call
-unpackable flat to_dict()              205.1 ns/call
-manual slotted to_dict()               152.6 ns/call
-dataclasses.asdict(slotted)           2066.7 ns/call
-unpackable dynamic to_dict()          2088.0 ns/call
-dynamic __dict__.copy()                184.9 ns/call
-manual dynamic to_dict()               158.1 ns/call
-attrs.asdict(obj)                     1043.7 ns/call
-pydantic.model_dump()                 1263.7 ns/call
-msgspec.to_builtins(obj)               256.8 ns/call
+unpackable slotted tuple(obj)          539.3 ns/call
+unpackable slotted {**obj}             952.6 ns/call
+unpackable recursive to_dict()         486.1 ns/call
+unpackable runtime flat to_dict()      212.4 ns/call
+unpackable flat to_dict()              210.1 ns/call
+projector flat to_dict()               259.3 ns/call
+manual slotted to_dict()               154.8 ns/call
+dataclasses.asdict(slotted)           2042.5 ns/call
+projector records(100)               21189.8 ns/call
+projector columns(100)               11708.8 ns/call
+helper to_records(100)               23190.3 ns/call
+helper to_columns(100)               15724.3 ns/call
+attrs.asdict(obj)                     1016.4 ns/call
+pydantic.model_dump()                 1244.0 ns/call
+msgspec.to_builtins(obj)               260.4 ns/call
+msgspec.to_builtins(100)             15086.3 ns/call
 ```
 
-For flat slotted objects, shallow `to_dict()` can be faster than framework dump methods, including `msgspec.to_builtins()` in this benchmark. Hand-written methods, direct `__dict__` copies, and compiled serializers can still win. msgspec remains the right choice for compiled serialization, JSON bytes, and broad schema-driven performance.
+For flat slotted objects, shallow `to_dict()` can be faster than framework dump methods, including `msgspec.to_builtins()` in this benchmark. For batches, record output and column output are different shapes: msgspec is faster than `projector.records(100)`, while `projector.columns(100)` is faster than msgspec's 100-record builtins conversion because it extracts columnar lists directly. Hand-written methods, direct `__dict__` copies, and compiled serializers can still win. msgspec remains the right choice for compiled serialization, JSON bytes, and broad schema-driven performance.
 
 To create a benchmark environment with Python 3.12 and all optional comparison libraries:
 

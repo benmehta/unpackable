@@ -25,6 +25,17 @@ T = TypeVar("T")
 
 _SKIP_SLOTS = frozenset({"__dict__", "__weakref__"})
 _ATOMIC_TYPES = frozenset({type(None), bool, int, float, str, bytes})
+_PROJECTOR_CACHE: Dict[
+    Tuple[
+        Type[Any],
+        Optional[Tuple[str, ...]],
+        Tuple[str, ...],
+        bool,
+        Tuple[Tuple[str, str], ...],
+        Optional[bool],
+    ],
+    "Projector",
+] = {}
 
 
 class SupportsUnpackable(Protocol):
@@ -44,6 +55,31 @@ class SupportsUnpackable(Protocol):
         ...
 
 
+class Projector(Protocol):
+    fields: Tuple[str, ...]
+
+    def to_dict(self, obj: Any, *, recursive: Optional[bool] = None) -> Dict[str, Any]:
+        ...
+
+    def to_tuple(self, obj: Any, *, recursive: Optional[bool] = None) -> Tuple[Any, ...]:
+        ...
+
+    def records(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
+        ...
+
+    def tuples(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> List[Tuple[Any, ...]]:
+        ...
+
+    def columns(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> Dict[str, List[Any]]:
+        ...
+
+
 @dataclass(frozen=True)
 class _Plan:
     source_names: Tuple[str, ...]
@@ -55,6 +91,53 @@ class _Plan:
     include_private: bool
     recursive: bool
     static: bool
+
+
+@dataclass(frozen=True)
+class _CompiledProjector:
+    _plan: _Plan
+    _to_dict: Callable[[Any, Optional[bool]], Dict[str, Any]]
+    _to_tuple: Callable[[Any, Optional[bool]], Tuple[Any, ...]]
+    _columns: Callable[[Iterable[Any], Optional[bool]], Dict[str, List[Any]]]
+
+    @property
+    def fields(self) -> Tuple[str, ...]:
+        return self._plan.public_names
+
+    @property
+    def source_fields(self) -> Tuple[str, ...]:
+        return self._plan.source_names
+
+    def to_dict(self, obj: Any, *, recursive: Optional[bool] = None) -> Dict[str, Any]:
+        return self._to_dict(obj, recursive)
+
+    def to_tuple(self, obj: Any, *, recursive: Optional[bool] = None) -> Tuple[Any, ...]:
+        return self._to_tuple(obj, recursive)
+
+    def records(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
+        return [self._to_dict(obj, recursive) for obj in objects]
+
+    def tuples(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> List[Tuple[Any, ...]]:
+        return [self._to_tuple(obj, recursive) for obj in objects]
+
+    def columns(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> Dict[str, List[Any]]:
+        return self._columns(objects, recursive)
+
+    def to_records(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
+        return self.records(objects, recursive=recursive)
+
+    def to_columns(
+        self, objects: Iterable[Any], *, recursive: Optional[bool] = None
+    ) -> Dict[str, List[Any]]:
+        return self.columns(objects, recursive=recursive)
 
 
 def _unique(names: Iterable[str]) -> Tuple[str, ...]:
@@ -188,6 +271,12 @@ def _attr_expr(name: str) -> str:
     return f"getattr(self, {name!r})"
 
 
+def _obj_attr_expr(name: str) -> str:
+    if name.isidentifier() and not keyword.iskeyword(name):
+        return f"obj.{name}"
+    return f"getattr(obj, {name!r})"
+
+
 def _missing_key(obj: Any, key: str) -> KeyError:
     return KeyError(f"{type(obj).__name__!s} has no unpacked field {key!r}")
 
@@ -293,6 +382,215 @@ def _project_tuple(
         _convert_field(value, jsonable=False, recursive=recursive)
         for _, value in _plan_items(obj, plan)
     )
+
+
+def _make_static_projector(plan: _Plan) -> _CompiledProjector:
+    lines = [
+        "def to_dict(obj, recursive):",
+        "    should_recurse = _plan_recursive if recursive is None else recursive",
+        "    if not should_recurse:",
+        "        try:",
+    ]
+    if plan.public_names:
+        shallow_entries = ", ".join(
+            f"{public_name!r}: {_obj_attr_expr(source_name)}"
+            for public_name, source_name in zip(plan.public_names, plan.source_names)
+        )
+        lines.append(f"            return {{{shallow_entries}}}")
+    else:
+        lines.append("            return {}")
+    lines.extend(["        except AttributeError:", "            out = {}"])
+    for public_name, source_name in zip(plan.public_names, plan.source_names):
+        attr = _obj_attr_expr(source_name)
+        lines.extend(
+            [
+                "            try:",
+                f"                out[{public_name!r}] = {attr}",
+                "            except AttributeError:",
+                "                pass",
+            ]
+        )
+    lines.extend(["            return out", "    try:"])
+    for index, source_name in enumerate(plan.source_names):
+        attr = _obj_attr_expr(source_name)
+        lines.append(f"        value_{index} = {attr}")
+    if plan.public_names:
+        entries = ", ".join(
+            f"{public_name!r}: _convert_field(value_{index}, jsonable=False, recursive=True)"
+            for index, public_name in enumerate(plan.public_names)
+        )
+        lines.append(f"        return {{{entries}}}")
+    else:
+        lines.append("        return {}")
+    lines.extend(["    except AttributeError:", "        out = {}"])
+    for public_name, source_name in zip(plan.public_names, plan.source_names):
+        attr = _obj_attr_expr(source_name)
+        lines.extend(
+            [
+                "        try:",
+                f"            value = {attr}",
+                f"            out[{public_name!r}] = _convert_field(value, jsonable=False, recursive=True)",
+                "        except AttributeError:",
+                "            pass",
+            ]
+        )
+    lines.append("    return out")
+
+    lines.extend(
+        [
+            "",
+            "def to_tuple(obj, recursive):",
+            "    should_recurse = _plan_recursive if recursive is None else recursive",
+            "    if not should_recurse:",
+            "        try:",
+        ]
+    )
+    if plan.source_names:
+        shallow_values = ", ".join(
+            _obj_attr_expr(name) for name in plan.source_names
+        )
+        lines.append(f"            return ({shallow_values},)")
+    else:
+        lines.append("            return ()")
+    lines.extend(["        except AttributeError:", "            out = []"])
+    for source_name in plan.source_names:
+        attr = _obj_attr_expr(source_name)
+        lines.extend(
+            [
+                "            try:",
+                f"                out.append({attr})",
+                "            except AttributeError:",
+                "                pass",
+            ]
+        )
+    lines.extend(["            return tuple(out)", "    try:"])
+    for index, source_name in enumerate(plan.source_names):
+        attr = _obj_attr_expr(source_name)
+        lines.append(f"        value_{index} = {attr}")
+    if plan.source_names:
+        values = ", ".join(
+            f"_convert_field(value_{index}, jsonable=False, recursive=True)"
+            for index, _ in enumerate(plan.source_names)
+        )
+        lines.append(f"        return ({values},)")
+    else:
+        lines.append("        return ()")
+    lines.extend(["    except AttributeError:", "        out = []"])
+    for source_name in plan.source_names:
+        attr = _obj_attr_expr(source_name)
+        lines.extend(
+            [
+                "        try:",
+                f"            value = {attr}",
+                "            out.append(_convert_field(value, jsonable=False, recursive=True))",
+                "        except AttributeError:",
+                "            pass",
+            ]
+        )
+    lines.append("    return tuple(out)")
+
+    lines.extend(["", "def columns(objects, recursive):"])
+    for index, _ in enumerate(plan.public_names):
+        lines.append(f"    col_{index} = []")
+        lines.append(f"    append_{index} = col_{index}.append")
+    lines.extend(
+        [
+            "    should_recurse = _plan_recursive if recursive is None else recursive",
+            "    if not should_recurse:",
+            "        for obj in objects:",
+        ]
+    )
+    for index, source_name in enumerate(plan.source_names):
+        attr = _obj_attr_expr(source_name)
+        lines.extend(
+            [
+                "            try:",
+                f"                append_{index}({attr})",
+                "            except AttributeError:",
+                f"                append_{index}(None)",
+            ]
+        )
+    lines.append("    else:")
+    lines.append("        for obj in objects:")
+    for index, source_name in enumerate(plan.source_names):
+        attr = _obj_attr_expr(source_name)
+        lines.extend(
+            [
+                "            try:",
+                f"                value = {attr}",
+                f"                append_{index}(_convert_field(value, jsonable=False, recursive=True))",
+                "            except AttributeError:",
+                f"                append_{index}(None)",
+            ]
+        )
+    if plan.public_names:
+        columns_entries = ", ".join(
+            f"{public_name!r}: col_{index}"
+            for index, public_name in enumerate(plan.public_names)
+        )
+        lines.append(f"    return {{{columns_entries}}}")
+    else:
+        lines.append("    return {}")
+
+    namespace = {
+        "_convert_field": _convert_field,
+        "_plan_recursive": plan.recursive,
+        "AttributeError": AttributeError,
+        "tuple": tuple,
+    }
+    local_namespace: Dict[str, Callable[..., Any]] = {}
+    exec("\n".join(lines), namespace, local_namespace)
+    return _CompiledProjector(
+        plan,
+        local_namespace["to_dict"],
+        local_namespace["to_tuple"],
+        local_namespace["columns"],
+    )
+
+
+def _make_dynamic_projector(plan: _Plan) -> _CompiledProjector:
+    def to_dict(obj: Any, recursive: Optional[bool]) -> Dict[str, Any]:
+        should_recurse = plan.recursive if recursive is None else recursive
+        return {
+            key: _convert_field(value, jsonable=False, recursive=should_recurse)
+            for key, value in _iter_dynamic_items(obj, plan)
+        }
+
+    def to_tuple(obj: Any, recursive: Optional[bool]) -> Tuple[Any, ...]:
+        should_recurse = plan.recursive if recursive is None else recursive
+        return tuple(
+            _convert_field(value, jsonable=False, recursive=should_recurse)
+            for _, value in _iter_dynamic_items(obj, plan)
+        )
+
+    def columns(
+        objects: Iterable[Any], recursive: Optional[bool]
+    ) -> Dict[str, List[Any]]:
+        should_recurse = plan.recursive if recursive is None else recursive
+        out: Dict[str, List[Any]] = {}
+        row_index = 0
+        for obj in objects:
+            seen = set()
+            for key, value in _iter_dynamic_items(obj, plan):
+                if key not in out:
+                    out[key] = [None] * row_index
+                out.setdefault(key, []).append(
+                    _convert_field(value, jsonable=False, recursive=should_recurse)
+                )
+                seen.add(key)
+            for key, values in out.items():
+                if key not in seen:
+                    values.append(None)
+            row_index += 1
+        return out
+
+    return _CompiledProjector(plan, to_dict, to_tuple, columns)
+
+
+def _make_projector(plan: _Plan) -> _CompiledProjector:
+    if plan.static:
+        return _make_static_projector(plan)
+    return _make_dynamic_projector(plan)
 
 
 def _make_static_methods(plan: _Plan) -> Dict[str, Callable[..., Any]]:
@@ -873,6 +1171,184 @@ def fields(
     if isinstance(obj_or_cls, type):
         return ()
     return tuple(key for key, _ in _plan_items(obj_or_cls, plan))
+
+
+def compile_projector(
+    obj_or_cls: Any,
+    *,
+    fields: Optional[Iterable[str]] = None,
+    exclude: Iterable[str] = (),
+    include_private: bool = False,
+    aliases: Optional[Mapping[str, str]] = None,
+    recursive: Optional[bool] = None,
+) -> Projector:
+    fields_tuple = tuple(fields) if fields is not None else None
+    exclude_tuple = tuple(exclude)
+    aliases_tuple = tuple(sorted((aliases or {}).items()))
+    cls = obj_or_cls if isinstance(obj_or_cls, type) else type(obj_or_cls)
+    cache_key = (
+        cls,
+        fields_tuple,
+        exclude_tuple,
+        include_private,
+        aliases_tuple,
+        recursive,
+    )
+    cached = _PROJECTOR_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    existing_plan = getattr(obj_or_cls, "__unpackable_plan__", None)
+    if existing_plan is None and not isinstance(obj_or_cls, type):
+        existing_plan = getattr(type(obj_or_cls), "__unpackable_plan__", None)
+
+    has_overrides = bool(fields_tuple or exclude_tuple or include_private or aliases_tuple)
+    if existing_plan is not None and not has_overrides:
+        if recursive is None:
+            plan = existing_plan
+        else:
+            plan = _Plan(
+                source_names=existing_plan.source_names,
+                public_names=existing_plan.public_names,
+                key_to_source=existing_plan.key_to_source,
+                aliases=existing_plan.aliases,
+                source_by_alias=existing_plan.source_by_alias,
+                exclude=existing_plan.exclude,
+                include_private=existing_plan.include_private,
+                recursive=recursive,
+                static=existing_plan.static,
+            )
+    else:
+        plan = _plain_plan(
+            obj_or_cls,
+            fields=fields_tuple,
+            exclude=exclude_tuple,
+            include_private=include_private,
+            recursive=existing_plan.recursive if recursive is None and existing_plan is not None else True if recursive is None else recursive,
+            aliases=dict(aliases_tuple),
+        )
+    projector = _make_projector(plan)
+    _PROJECTOR_CACHE[cache_key] = projector
+    return projector
+
+
+def _first_and_projector(
+    objects: Iterable[Any],
+    *,
+    fields: Optional[Iterable[str]],
+    exclude: Iterable[str],
+    include_private: bool,
+    aliases: Optional[Mapping[str, str]],
+    recursive: Optional[bool],
+) -> Tuple[Optional[Any], Iterator[Any], Projector]:
+    iterator = iter(objects)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return None, iter(()), compile_projector(
+            object,
+            fields=fields or (),
+            exclude=exclude,
+            include_private=include_private,
+            aliases=aliases,
+            recursive=True if recursive is None else recursive,
+        )
+    projector = compile_projector(
+        first,
+        fields=fields,
+        exclude=exclude,
+        include_private=include_private,
+        aliases=aliases,
+        recursive=recursive,
+    )
+    return first, iterator, projector
+
+
+def to_records(
+    objects: Iterable[Any],
+    *,
+    fields: Optional[Iterable[str]] = None,
+    exclude: Iterable[str] = (),
+    include_private: bool = False,
+    aliases: Optional[Mapping[str, str]] = None,
+    recursive: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    first, rest, projector = _first_and_projector(
+        objects,
+        fields=fields,
+        exclude=exclude,
+        include_private=include_private,
+        aliases=aliases,
+        recursive=recursive,
+    )
+    if first is None:
+        return []
+    return [projector.to_dict(first)] + projector.records(rest)
+
+
+def to_tuples(
+    objects: Iterable[Any],
+    *,
+    fields: Optional[Iterable[str]] = None,
+    exclude: Iterable[str] = (),
+    include_private: bool = False,
+    aliases: Optional[Mapping[str, str]] = None,
+    recursive: Optional[bool] = None,
+) -> List[Tuple[Any, ...]]:
+    first, rest, projector = _first_and_projector(
+        objects,
+        fields=fields,
+        exclude=exclude,
+        include_private=include_private,
+        aliases=aliases,
+        recursive=recursive,
+    )
+    if first is None:
+        return []
+    return [projector.to_tuple(first)] + projector.tuples(rest)
+
+
+def to_columns(
+    objects: Iterable[Any],
+    *,
+    fields: Optional[Iterable[str]] = None,
+    exclude: Iterable[str] = (),
+    include_private: bool = False,
+    aliases: Optional[Mapping[str, str]] = None,
+    recursive: Optional[bool] = None,
+) -> Dict[str, List[Any]]:
+    first, rest, projector = _first_and_projector(
+        objects,
+        fields=fields,
+        exclude=exclude,
+        include_private=include_private,
+        aliases=aliases,
+        recursive=recursive,
+    )
+    if first is None:
+        return {name: [] for name in fields or ()}
+
+    def all_objects() -> Iterator[Any]:
+        yield first
+        yield from rest
+
+    return projector.columns(all_objects(), recursive=recursive)
+
+
+def to_pandas(objects: Iterable[Any], **kwargs: Any) -> Any:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError("to_pandas() requires pandas to be installed") from exc
+    return pd.DataFrame(to_columns(objects, **kwargs))
+
+
+def to_arrow(objects: Iterable[Any], **kwargs: Any) -> Any:
+    try:
+        import pyarrow as pa
+    except ImportError as exc:
+        raise ImportError("to_arrow() requires pyarrow to be installed") from exc
+    return pa.table(to_columns(objects, **kwargs))
 
 
 def asdict(
