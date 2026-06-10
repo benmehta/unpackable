@@ -1,0 +1,14 @@
+name: unpackable-bench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -e .
+      - attrs
+      - pydantic
+      - msgspec
+      - pytest
+      - build
+      - twine
