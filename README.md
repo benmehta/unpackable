@@ -241,9 +241,9 @@ class Prediction:
 
 
 predictions = [
-    Prediction("u1", "fraud-v4", 0.91, 1, 12.4),
-    Prediction("u2", "fraud-v4", 0.08, 0, 9.7),
-    Prediction("u3", "fraud-v4", 0.63, 1, 14.1),
+    Prediction("u1", "model-v4", 0.91, 1, 12.4),
+    Prediction("u2", "model-v4", 0.08, 0, 9.7),
+    Prediction("u3", "model-v4", 0.63, 1, 14.1),
 ]
 
 projector = compile_projector(Prediction)
@@ -257,7 +257,7 @@ records = projector.records(predictions)
 ```python
 {
     "user_id": ["u1", "u2", "u3"],
-    "model_version": ["fraud-v4", "fraud-v4", "fraud-v4"],
+    "model_version": ["model-v4", "model-v4", "model-v4"],
     "score": [0.91, 0.08, 0.63],
     "label": [1, 0, 1],
     "latency_ms": [12.4, 9.7, 14.1],
